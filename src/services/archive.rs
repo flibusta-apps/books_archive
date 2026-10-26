@@ -116,13 +116,13 @@ fn find_in_archive(path: &Path, id: u64) -> Result<Option<Found>, ArchiveError> 
     let archive = ZipArchive::new(File::open(path)?)?;
     let id_s = id.to_string();
     for i in 0..archive.len() {
-        let Some(name) = archive.name_for_index(i) else {
+        let Some(Ok(name)) = archive.name_for_index(i) else {
             continue;
         };
         if name.ends_with('/') {
             continue;
         }
-        let base = name.rsplit('/').next().unwrap_or(name);
+        let base = name.rsplit('/').next().unwrap_or(&name);
         let Some((stem, ext)) = base.rsplit_once('.') else {
             continue;
         };

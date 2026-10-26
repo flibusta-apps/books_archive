@@ -174,7 +174,7 @@ pub fn load_from<R: Read + Seek>(reader: R, dir: &Path) -> Result<InpxIndex, Arc
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_string();
+        let name = entry.name()?.into_owned();
         let base = name.rsplit('/').next().unwrap_or(&name);
         buf.clear();
         if base.eq_ignore_ascii_case("version.info") {

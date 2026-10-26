@@ -290,7 +290,7 @@ mod tests {
         let mut f = z.by_index(0).unwrap();
         let mut buf = vec![];
         f.read_to_end(&mut buf).unwrap();
-        (f.name().to_string(), buf)
+        (f.name().unwrap().into_owned(), buf)
     }
 
     #[tokio::test]
