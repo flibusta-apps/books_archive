@@ -1,0 +1,13 @@
+.mypy_cache
+.vscode
+
+__pycache__
+
+venv
+
+target
+
+docs/specs
+
+# local book archives
+data
