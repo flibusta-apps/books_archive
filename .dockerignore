@@ -4,3 +4,5 @@
 target
 data
 docs
+
+.env*

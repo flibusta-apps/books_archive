@@ -6,3 +6,6 @@ docs/specs
 
 # local book archives
 data
+
+.env
+.env.*

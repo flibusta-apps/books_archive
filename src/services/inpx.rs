@@ -12,7 +12,7 @@
 use std::{
     collections::HashMap,
     fs::File,
-    io::{Read, Seek},
+    io::{BufRead, BufReader, Read, Seek},
     path::{Path, PathBuf},
 };
 
@@ -20,6 +20,63 @@ use tracing::warn;
 use zip::ZipArchive;
 
 use super::archive::ArchiveError;
+
+/// Longest accepted `.inp` line; longer lines are skipped as malformed.
+const MAX_LINE: usize = 64 * 1024;
+/// Largest accepted `version.info` / `structure.info`.
+const MAX_INFO: u64 = 64 * 1024;
+/// Cap on the number of indexed books.
+const MAX_BOOKS: usize = 10_000_000;
+
+/// Field positions inside an `.inp` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Layout {
+    file: usize,
+    libid: usize,
+    del: usize,
+    ext: usize,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Layout {
+            file: 5,
+            libid: 7,
+            del: 8,
+            ext: 9,
+        }
+    }
+}
+
+impl Layout {
+    /// Parses `structure.info` (`AUTHOR;GENRE;...;FILE;SIZE;LIBID;DEL;EXT;...`).
+    fn from_structure(text: &str) -> Layout {
+        let names: Vec<String> = text
+            .trim()
+            .split(';')
+            .map(|n| n.trim().to_ascii_uppercase())
+            .collect();
+        let pos = |n: &str| names.iter().position(|x| x == n);
+        match (pos("FILE"), pos("LIBID"), pos("DEL"), pos("EXT")) {
+            (Some(file), Some(libid), Some(del), Some(ext)) => {
+                let l = Layout {
+                    file,
+                    libid,
+                    del,
+                    ext,
+                };
+                if l != Layout::default() {
+                    warn!("structure.info differs from the default field order: {l:?}");
+                }
+                l
+            }
+            _ => {
+                warn!("structure.info lacks FILE/LIBID/DEL/EXT; using the default field order");
+                Layout::default()
+            }
+        }
+    }
+}
 
 struct Book {
     /// Entry file stem; empty when it equals the LIBID (the common case).
@@ -42,6 +99,8 @@ pub struct InpxIndex {
 /// Result of an INPX lookup.
 pub struct Hit {
     pub archive: PathBuf,
+    /// Catalog FILE field (entry stem).
+    pub file: String,
     pub entry: String,
     /// Lowercase extension.
     pub ext: String,
@@ -71,6 +130,11 @@ impl InpxIndex {
         };
         Some(Hit {
             archive: self.archives[b.archive as usize].clone(),
+            file: if b.file.is_empty() {
+                id.to_string()
+            } else {
+                b.file.to_string()
+            },
             entry,
             ext: ext.to_lowercase(),
         })
@@ -84,17 +148,34 @@ struct Parsed<'a> {
     ext: &'a str,
 }
 
-fn parse_line(line: &[u8]) -> Option<Parsed<'_>> {
-    let mut f = line.split(|b| *b == 4);
-    let file = std::str::from_utf8(f.nth(5)?).ok()?;
-    let _size = f.next()?;
-    let libid = std::str::from_utf8(f.next()?).ok()?.trim().parse().ok()?;
-    let deleted = match f.next()? {
+fn parse_line<'a>(line: &'a [u8], l: &Layout) -> Option<Parsed<'a>> {
+    let max = l.file.max(l.libid).max(l.del).max(l.ext);
+    let (mut file, mut libid, mut del, mut ext) = (None, None, None, None);
+    for (i, f) in line.split(|b| *b == 4).enumerate() {
+        if i == l.file {
+            file = Some(f);
+        }
+        if i == l.libid {
+            libid = Some(f);
+        }
+        if i == l.del {
+            del = Some(f);
+        }
+        if i == l.ext {
+            ext = Some(f);
+        }
+        if i >= max {
+            break;
+        }
+    }
+    let file = std::str::from_utf8(file?).ok()?;
+    let libid = std::str::from_utf8(libid?).ok()?.trim().parse().ok()?;
+    let deleted = match del? {
         b"0" | b"" => false,
         b"1" => true,
         _ => return None,
     };
-    let ext = std::str::from_utf8(f.next()?).ok()?.trim();
+    let ext = std::str::from_utf8(ext?).ok()?.trim();
     if file.is_empty() || ext.is_empty() {
         return None;
     }
@@ -106,25 +187,81 @@ fn parse_line(line: &[u8]) -> Option<Parsed<'_>> {
     })
 }
 
+/// Reads one line (without terminator) of at most `MAX_LINE` bytes.
+/// Returns `Ok(None)` at EOF and `Ok(Some(false))` for an over-long line (skipped).
+fn read_line(r: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<Option<bool>> {
+    buf.clear();
+    let n = r
+        .by_ref()
+        .take(MAX_LINE as u64 + 1)
+        .read_until(b'\n', buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        return Ok(Some(true));
+    }
+    if buf.len() <= MAX_LINE {
+        return Ok(Some(true)); // last line without newline
+    }
+    // Over-long: discard the rest of the line.
+    loop {
+        let (done, used) = {
+            let chunk = r.fill_buf()?;
+            if chunk.is_empty() {
+                break;
+            }
+            match chunk.iter().position(|b| *b == b'\n') {
+                Some(i) => (true, i + 1),
+                None => (false, chunk.len()),
+            }
+        };
+        r.consume(used);
+        if done {
+            break;
+        }
+    }
+    Ok(Some(false))
+}
+
 impl InpxIndex {
-    fn add_inp(&mut self, data: &[u8], archive: u32) {
+    fn add_inp(
+        &mut self,
+        mut data: impl BufRead,
+        archive: u32,
+        layout: &Layout,
+    ) -> Result<(), ArchiveError> {
         let mut ext_ids: HashMap<String, u16> = HashMap::new();
         for (i, e) in self.exts.iter().enumerate() {
             ext_ids.insert(e.to_string(), i as u16);
         }
-        for raw in data.split(|b| *b == b'\n') {
-            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let mut buf = Vec::new();
+        while let Some(ok) = read_line(&mut data, &mut buf)? {
+            if !ok {
+                self.malformed += 1;
+                continue;
+            }
+            let line = buf.strip_suffix(b"\r").unwrap_or(&buf);
             if line.is_empty() {
                 continue;
             }
-            let Some(p) = parse_line(line) else {
+            let Some(p) = parse_line(line, layout) else {
                 self.malformed += 1;
                 continue;
             };
-            if let Some(old) = self.books.get(&p.libid) {
-                if !old.deleted && p.deleted {
-                    continue;
+            match self.books.get(&p.libid) {
+                Some(old) => {
+                    if !old.deleted && p.deleted {
+                        continue;
+                    }
                 }
+                None if self.books.len() >= MAX_BOOKS => {
+                    return Err(ArchiveError::Limit(format!(
+                        "INPX has more than {MAX_BOOKS} books"
+                    )));
+                }
+                None => {}
             }
             let ext = match ext_ids.get(p.ext) {
                 Some(i) => *i,
@@ -153,6 +290,7 @@ impl InpxIndex {
                 },
             );
         }
+        Ok(())
     }
 }
 
@@ -168,33 +306,52 @@ pub fn load_from<R: Read + Seek>(reader: R, dir: &Path) -> Result<InpxIndex, Arc
         version: "unknown".into(),
         ..Default::default()
     };
-    let mut buf = Vec::new();
+    // First pass: small info files (order inside the zip is arbitrary).
+    let mut layout = Layout::default();
     for i in 0..zip.len() {
-        let mut entry = zip.by_index(i)?;
+        let entry = zip.by_index(i)?;
         if entry.is_dir() {
             continue;
         }
         let name = entry.name()?.into_owned();
         let base = name.rsplit('/').next().unwrap_or(&name);
-        buf.clear();
-        if base.eq_ignore_ascii_case("version.info") {
-            entry.read_to_end(&mut buf)?;
-            let v = String::from_utf8_lossy(&buf).trim().to_string();
-            if !v.is_empty() {
-                index.version = v;
-            }
+        let is_version = base.eq_ignore_ascii_case("version.info");
+        let is_structure = base.eq_ignore_ascii_case("structure.info");
+        if !is_version && !is_structure {
             continue;
         }
+        let mut buf = Vec::new();
+        entry.take(MAX_INFO + 1).read_to_end(&mut buf)?;
+        if buf.len() as u64 > MAX_INFO {
+            warn!("{base} is larger than {MAX_INFO} bytes; ignored");
+            continue;
+        }
+        let text = String::from_utf8_lossy(&buf).trim().to_string();
+        if is_version {
+            if !text.is_empty() {
+                index.version = text;
+            }
+        } else {
+            layout = Layout::from_structure(&text);
+        }
+    }
+    for i in 0..zip.len() {
+        let entry = zip.by_index(i)?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name()?.into_owned();
+        let base = name.rsplit('/').next().unwrap_or(&name);
         let Some(stem) = base
             .strip_suffix(".inp")
             .or_else(|| base.strip_suffix(".INP"))
         else {
             continue;
         };
-        entry.read_to_end(&mut buf)?;
-        let archive = u32::try_from(index.archives.len()).expect("too many archives");
+        let archive = u32::try_from(index.archives.len())
+            .map_err(|_| ArchiveError::Limit("too many archives".into()))?;
         index.archives.push(dir.join(format!("{stem}.zip")));
-        index.add_inp(&buf, archive);
+        index.add_inp(BufReader::new(entry), archive, &layout)?;
     }
     if index.malformed > 0 {
         warn!("Skipped {} malformed INPX lines", index.malformed);
@@ -220,29 +377,33 @@ fn inpx_in(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-/// Finds an `.inpx` in `dir` (non-recursive), then one level deep.
+/// Finds the single `.inpx` in `dir` (non-recursive), else one level deep.
+/// Several candidates are an error: the caller must set `INPX_PATH`.
 /// Only directory entries are listed; archives are never opened.
-pub fn discover(dir: &Path) -> Option<PathBuf> {
+pub fn discover(dir: &Path) -> Result<Option<PathBuf>, String> {
     let mut found = inpx_in(dir);
     if found.is_empty() {
-        let mut subdirs: Vec<PathBuf> = std::fs::read_dir(dir)
-            .ok()?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
+        let mut subdirs: Vec<PathBuf> = match std::fs::read_dir(dir) {
+            Ok(rd) => rd
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.path())
+                .collect(),
+            Err(_) => return Ok(None),
+        };
         subdirs.sort();
         for d in subdirs {
             found.extend(inpx_in(&d));
-            if !found.is_empty() {
-                break;
-            }
         }
     }
     if found.len() > 1 {
-        warn!("Several .inpx files found, using {}", found[0].display());
+        let list: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
+        return Err(format!(
+            "several .inpx files found ({}); set INPX_PATH to choose one",
+            list.join(", ")
+        ));
     }
-    found.into_iter().next()
+    Ok(found.into_iter().next())
 }
 
 #[cfg(test)]
@@ -259,7 +420,7 @@ pub mod tests {
     #[test]
     fn parses_line_with_trailing_sep() {
         let l = line("110119", "1230745", "0", "fb2");
-        let p = parse_line(l.as_bytes()).unwrap();
+        let p = parse_line(l.as_bytes(), &Layout::default()).unwrap();
         assert_eq!(p.file, "110119");
         assert_eq!(p.libid, 1230745);
         assert!(!p.deleted);
@@ -268,10 +429,10 @@ pub mod tests {
 
     #[test]
     fn rejects_malformed() {
-        assert!(parse_line(b"a\x04b\x04c").is_none());
-        assert!(parse_line(line("1", "abc", "0", "fb2").as_bytes()).is_none());
-        assert!(parse_line(line("1", "5", "0", "").as_bytes()).is_none());
-        assert!(parse_line(line("1", "5", "x", "fb2").as_bytes()).is_none());
+        assert!(parse_line(b"a\x04b\x04c", &Layout::default()).is_none());
+        assert!(parse_line(line("1", "abc", "0", "fb2").as_bytes(), &Layout::default()).is_none());
+        assert!(parse_line(line("1", "5", "0", "").as_bytes(), &Layout::default()).is_none());
+        assert!(parse_line(line("1", "5", "x", "fb2").as_bytes(), &Layout::default()).is_none());
     }
 
     #[test]
@@ -323,12 +484,33 @@ pub mod tests {
     #[test]
     fn discovers_inpx() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(discover(dir.path()).is_none());
+        assert_eq!(discover(dir.path()), Ok(None));
         let sub = dir.path().join("fb2.X");
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(sub.join("a.inpx"), b"").unwrap();
-        assert_eq!(discover(dir.path()), Some(sub.join("a.inpx")));
+        assert_eq!(discover(dir.path()), Ok(Some(sub.join("a.inpx"))));
         std::fs::write(dir.path().join("top.inpx"), b"").unwrap();
-        assert_eq!(discover(dir.path()), Some(dir.path().join("top.inpx")));
+        assert_eq!(discover(dir.path()), Ok(Some(dir.path().join("top.inpx"))));
+        std::fs::write(dir.path().join("top2.inpx"), b"").unwrap();
+        assert!(discover(dir.path()).is_err());
+    }
+
+    #[test]
+    fn honors_structure_info_and_line_limit() {
+        let long = "x".repeat(MAX_LINE + 10);
+        let a = format!("{long}\n9\x04ep\x04fileX\x040\x04pdf\n",);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.inpx");
+        make_zip(
+            &p,
+            &[
+                ("a.inp", a.as_bytes()),
+                ("structure.info", b"LIBID;GENRE;FILE;DEL;EXT"),
+            ],
+        );
+        let idx = load(&p).unwrap();
+        assert_eq!(idx.malformed, 1);
+        let h = idx.lookup(9).unwrap();
+        assert_eq!(h.entry, "fileX.pdf");
     }
 }

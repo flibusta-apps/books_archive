@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -12,14 +12,30 @@ use axum::{
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio_util::io::ReaderStream;
+use tower::limit::ConcurrencyLimitLayer;
 use tracing::error;
 
-use crate::services::archive::{self, ArchiveError, Catalog};
+use crate::services::archive::{ArchiveError, Catalog};
 
 #[derive(Clone)]
 pub struct AppState {
     pub index: Arc<Catalog>,
     pub api_key: Option<Arc<str>>,
+    pub max_entry_bytes: u64,
+    pub timeout: Duration,
+    pub max_concurrent: usize,
+}
+
+impl AppState {
+    pub fn new(index: Arc<Catalog>, api_key: Option<Arc<str>>) -> AppState {
+        AppState {
+            index,
+            api_key,
+            max_entry_bytes: 512 * 1024 * 1024,
+            timeout: Duration::from_secs(600),
+            max_concurrent: 16,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -28,6 +44,10 @@ pub enum ApiError {
     NotFound,
     #[error("bad id")]
     BadId,
+    #[error("internal: {0}")]
+    Internal(String),
+    #[error("timeout")]
+    Timeout,
     #[error("unauthorized")]
     Unauthorized,
     #[error(transparent)]
@@ -40,6 +60,11 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::BadId => StatusCode::BAD_REQUEST,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ApiError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            ApiError::Internal(msg) => {
+                error!("Internal error: {msg}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             ApiError::Archive(err) => {
                 error!("Archive error: {err}");
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -71,39 +96,37 @@ pub fn content_type(ext: &str) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Kind {
-    Fb2,
-    Epub,
-    Mobi,
-    Any,
+/// Maps the (case-insensitive) route format to the required extension.
+/// `None` inside `Some` means "any extension".
+fn parse_format(format: &str) -> Option<Option<&'static str>> {
+    match format.to_ascii_lowercase().as_str() {
+        "fb2" => Some(Some("fb2")),
+        "epub" => Some(Some("epub")),
+        "mobi" => Some(Some("mobi")),
+        "download" => Some(None),
+        _ => None,
+    }
 }
 
 fn parse_id(id: &str) -> Result<u64, ApiError> {
     id.parse().map_err(|_| ApiError::BadId)
 }
 
-async fn serve(state: AppState, id: &str, kind: Kind) -> Result<Response, ApiError> {
-    let id = parse_id(id)?;
-    let found = state
-        .index
-        .find(id, |ext| match kind {
-            Kind::Fb2 => ext == "fb2",
-            Kind::Epub => ext == "epub",
-            Kind::Mobi => ext == "mobi",
-            Kind::Any => true,
-        })
-        .await?
+async fn get_book(
+    State(s): State<AppState>,
+    Path((id, format)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let want = parse_format(&format).ok_or(ApiError::NotFound)?;
+    let id = parse_id(&id)?;
+    let out = tokio::time::timeout(s.timeout, s.index.fetch(id, want, s.max_entry_bytes))
+        .await
+        .map_err(|_| ApiError::Timeout)??
         .ok_or(ApiError::NotFound)?;
-    let ext = found.ext.clone();
 
-    let as_zip = ext == "fb2";
-
-    let out = archive::open(found, id, as_zip).await?;
-    let (ctype, filename) = if as_zip {
-        ("application/zip", format!("{id}.fb2.zip"))
+    let (ctype, filename) = if out.zipped {
+        ("application/zip", format!("{id}.{}.zip", out.ext))
     } else {
-        (content_type(&ext), format!("{id}.{ext}"))
+        (content_type(&out.ext), format!("{id}.{}", out.ext))
     };
 
     let mut headers = HeaderMap::new();
@@ -112,28 +135,10 @@ async fn serve(state: AppState, id: &str, kind: Kind) -> Result<Response, ApiErr
     headers.insert(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
-            .map_err(|_| ApiError::BadId)?,
+            .map_err(|_| ApiError::Internal(format!("bad content-disposition {filename:?}")))?,
     );
-    Ok((headers, Body::from_stream(ReaderStream::new(out.file))).into_response())
-}
-
-async fn get_fb2(State(s): State<AppState>, Path(id): Path<String>) -> Result<Response, ApiError> {
-    serve(s, &id, Kind::Fb2).await
-}
-
-async fn get_epub(State(s): State<AppState>, Path(id): Path<String>) -> Result<Response, ApiError> {
-    serve(s, &id, Kind::Epub).await
-}
-
-async fn get_mobi(State(s): State<AppState>, Path(id): Path<String>) -> Result<Response, ApiError> {
-    serve(s, &id, Kind::Mobi).await
-}
-
-async fn get_download(
-    State(s): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Response, ApiError> {
-    serve(s, &id, Kind::Any).await
+    let stream = ReaderStream::with_capacity(out.file, 64 * 1024);
+    Ok((headers, Body::from_stream(stream)).into_response())
 }
 
 async fn auth(State(s): State<AppState>, req: Request, next: Next) -> Result<Response, ApiError> {
@@ -150,17 +155,25 @@ async fn auth(State(s): State<AppState>, req: Request, next: Next) -> Result<Res
     Ok(next.run(req).await)
 }
 
+async fn ready(State(s): State<AppState>) -> StatusCode {
+    if s.index.is_empty() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
+}
+
 pub fn get_router(state: AppState) -> Router {
     let books = Router::new()
-        .route("/b/{id}/fb2", get(get_fb2))
-        .route("/b/{id}/epub", get(get_epub))
-        .route("/b/{id}/mobi", get(get_mobi))
-        .route("/b/{id}/download", get(get_download))
+        .route("/b/{id}/{format}", get(get_book))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
-        .with_state(state);
+        .layer(ConcurrencyLimitLayer::new(state.max_concurrent))
+        .with_state(state.clone());
 
     Router::new()
         .route("/health", get(|| async { "OK" }))
+        .route("/ready", get(ready))
+        .with_state(state)
         .merge(books)
 }
 
@@ -183,10 +196,10 @@ mod tests {
             &dir.path().join("f.usr-000101-000200.zip"),
             &[("150.pdf", b"%PDF-1"), ("151.bin", b"zzz")],
         );
-        let state = AppState {
-            index: Arc::new(Catalog::Ranges(ArchiveIndex::scan(dir.path()))),
-            api_key: api_key.map(Arc::from),
-        };
+        let state = AppState::new(
+            Arc::new(Catalog::Ranges(ArchiveIndex::scan(dir.path()))),
+            api_key.map(Arc::from),
+        );
         (get_router(state), dir)
     }
 
@@ -202,13 +215,28 @@ mod tests {
                 ("5000.fb2", b"WRONG-GUESS"),
                 ("fileA.fb2", b"<FictionBook/>"),
                 ("fileB.EPUB", b"epubdata"),
+                // catalog says fb2 but entry is stored as .epub
+                ("mism.epub", b"mismatch"),
+                // FILE != LIBID, entry stored with different ext case
+                ("dir/other.Mobi", b"mobidata"),
+                // ambiguous fallback
+                ("amb.pdf", b"a"),
+                ("sub/amb.PDF", b"b"),
+                // the LIBID-named decoy must never be served for FILE != LIBID
+                ("5004.mobi", b"DECOY"),
             ],
         );
         let inp = format!(
-            "{}\r\n{}\r\n{}\r\n",
+            "{}\r\n{}\r\n{}\r\n{}\r\n",
             line("fileA", "5000", "0", "fb2"),
             line("fileB", "5001", "0", "EPUB"),
             line("ghost", "5002", "0", "fb2"),
+            line("mism", "5003", "0", "fb2"),
+        );
+        let inp = format!(
+            "{inp}{}\r\n{}\r\n",
+            line("other", "5004", "0", "mobi"),
+            line("amb", "5005", "0", "pdf"),
         );
         let inpx = sub.join("c.inpx");
         make_zip(
@@ -218,11 +246,8 @@ mod tests {
         if missing_archive {
             std::fs::remove_file(sub.join("books-a.zip")).unwrap();
         }
-        assert_eq!(inpx::discover(dir.path()), Some(inpx.clone()));
-        let state = AppState {
-            index: Arc::new(Catalog::Inpx(inpx::load(&inpx).unwrap())),
-            api_key: None,
-        };
+        assert_eq!(inpx::discover(dir.path()), Ok(Some(inpx.clone())));
+        let state = AppState::new(Arc::new(Catalog::Inpx(inpx::load(&inpx).unwrap())), None);
         (get_router(state), dir)
     }
 
@@ -253,10 +278,99 @@ mod tests {
             "/b/5001/mobi",
             "/b/1/fb2",
             "/b/5002/fb2",
+            // fallback by FILE finds .epub but fb2 was requested: ext mismatch
+            "/b/5003/fb2",
+            // ambiguous fallback is rejected
+            "/b/5005/pdf",
         ] {
             let (a, _d) = inpx_app(false);
             assert_eq!(call(a, uri, None).await.0, StatusCode::NOT_FOUND, "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn inpx_fallback_by_file_basename() {
+        // FILE != LIBID: found via FILE basename, never via `{LIBID}.*` decoy.
+        let (a, _d) = inpx_app(false);
+        let (st, h, body) = call(a, "/b/5004/mobi", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(h[header::CONTENT_TYPE], "application/x-mobipocket-ebook");
+        assert_eq!(body, b"mobidata");
+    }
+
+    #[tokio::test]
+    async fn format_is_case_insensitive() {
+        let (a, _d) = app(None);
+        let (st, _, body) = call(a, "/b/8/EPUB", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body, b"epubdata");
+        let (a, _d) = app(None);
+        assert_eq!(call(a, "/b/7/Fb2", None).await.0, StatusCode::OK);
+        let (a, _d) = app(None);
+        assert_eq!(call(a, "/b/7/nope", None).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn overlapping_ranges_with_format_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        make_zip(&dir.path().join("a-1-100.zip"), &[("5.fb2", b"fb")]);
+        make_zip(&dir.path().join("b-1-100.zip"), &[("5.epub", b"epubdata")]);
+        let state = AppState::new(
+            Arc::new(Catalog::Ranges(ArchiveIndex::scan(dir.path()))),
+            None,
+        );
+        let (st, _, body) = call(get_router(state.clone()), "/b/5/epub", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body, b"epubdata");
+        assert_eq!(
+            call(get_router(state), "/b/5/mobi", None).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_archive_is_500() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a-1-100.zip"), b"not a zip").unwrap();
+        let state = AppState::new(
+            Arc::new(Catalog::Ranges(ArchiveIndex::scan(dir.path()))),
+            None,
+        );
+        assert_eq!(
+            call(get_router(state), "/b/5/fb2", None).await.0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn spool_read_error_is_500() {
+        // Entry exceeding the byte cap fails while spooling.
+        let dir = tempfile::tempdir().unwrap();
+        make_zip(&dir.path().join("a-1-100.zip"), &[("5.epub", &[0u8; 100])]);
+        let mut state = AppState::new(
+            Arc::new(Catalog::Ranges(ArchiveIndex::scan(dir.path()))),
+            None,
+        );
+        state.max_entry_bytes = 10;
+        assert_eq!(
+            call(get_router(state), "/b/5/epub", None).await.0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_reflects_catalog() {
+        let (a, _d) = app(None);
+        assert_eq!(call(a, "/ready", None).await.0, StatusCode::OK);
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Arc::new(Catalog::Ranges(ArchiveIndex::scan(dir.path()))),
+            None,
+        );
+        assert_eq!(
+            call(get_router(state), "/ready", None).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]
