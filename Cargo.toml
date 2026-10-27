@@ -24,6 +24,8 @@ zip = { version = "9.0.5", default-features = false, features = ["deflate", "unr
 tempfile = "3.19.1"
 subtle = "2.6.1"
 
+tower = { version = "0.5.2", features = ["limit"] }
+
 [dev-dependencies]
-tower = { version = "0.5.2", features = ["util"] }
+tower = { version = "0.5.2", features = ["util", "limit"] }
 http-body-util = "0.1.3"

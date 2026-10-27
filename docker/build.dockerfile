@@ -12,14 +12,11 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 
-RUN apt-get update \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json
 
 COPY . .
-RUN cargo build --release --bin books_archive
+RUN cargo build --release --locked --bin books_archive
 
 
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
@@ -36,6 +33,6 @@ COPY --from=builder /app/target/release/books_archive /usr/local/bin/books_archi
 USER app
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD curl -f "http://localhost:${PORT:-8080}/health" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/books_archive"]

@@ -14,7 +14,7 @@ use crate::{
     },
     views::{get_router, AppState},
 };
-use tracing_subscriber::{filter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -46,13 +46,29 @@ async fn shutdown_signal() {
 async fn main() {
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_target(false))
-        .with(filter::LevelFilter::INFO)
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
     let dir = CONFIG.archive_dir.clone();
+    if let Err(err) = std::fs::read_dir(&dir) {
+        eprintln!(
+            "ARCHIVE_DIR {} does not exist or is not readable: {err}",
+            dir.display()
+        );
+        std::process::exit(1);
+    }
     let explicit = CONFIG.inpx_path.clone();
     let catalog = tokio::task::spawn_blocking(move || {
-        let inpx_path = explicit.or_else(|| inpx::discover(&dir));
+        let inpx_path = match explicit {
+            Some(p) => Some(p),
+            None => match inpx::discover(&dir) {
+                Ok(p) => p,
+                Err(msg) => {
+                    tracing::error!("{msg}");
+                    std::process::exit(1);
+                }
+            },
+        };
         if let Some(path) = inpx_path {
             let start = Instant::now();
             match inpx::load(&path) {
@@ -89,12 +105,12 @@ async fn main() {
     })
     .await
     .unwrap();
-    let state = AppState {
-        index: Arc::new(catalog),
-        api_key: CONFIG.api_key.as_deref().map(Arc::from),
-    };
+    let mut state = AppState::new(Arc::new(catalog), CONFIG.api_key.as_deref().map(Arc::from));
+    state.max_entry_bytes = CONFIG.max_entry_bytes;
+    state.timeout = CONFIG.request_timeout;
+    state.max_concurrent = CONFIG.max_concurrent_downloads;
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    let addr = SocketAddr::from(([0, 0, 0, 0], CONFIG.port));
 
     info!("Start webserver...");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
