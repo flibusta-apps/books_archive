@@ -1,5 +1,6 @@
 mod config;
 mod services;
+mod streaming;
 mod views;
 
 use std::{net::SocketAddr, sync::Arc, time::Instant};
@@ -71,7 +72,7 @@ async fn main() {
         };
         if let Some(path) = inpx_path {
             let start = Instant::now();
-            match inpx::load(&path) {
+            match inpx::load(&path, CONFIG.inpx_limits) {
                 Ok(idx) => {
                     if idx.is_empty() {
                         tracing::warn!("INPX {} contains no books", path.display());

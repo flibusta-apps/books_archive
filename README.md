@@ -18,7 +18,12 @@ Responses carry `Content-Length` and `Content-Disposition: attachment; filename=
 
 - `ARCHIVE_DIR` — required; directory with the archives. Scanned recursively at startup only in range-scan mode (restart to rescan).
 - `INPX_PATH` — optional; path to the `.inpx` catalog. If unset, a single `*.inpx` is looked up in `ARCHIVE_DIR` (non-recursive, then one level deep, e.g. `ARCHIVE_DIR/fb2.Flibusta.Net/*.inpx`).
-- `API_KEY` — optional; if set, `/b/*` requires header `Authorization: <key>`.
+- `API_KEY` — required and non-empty (whitespace-only values are rejected); `/b/*` requires header `Authorization: <key>`. Missing/empty keys fail at startup rather than exposing the archive.
+- `ALLOW_UNAUTHENTICATED` — defaults to disabled. Only the exact value `true` explicitly permits startup without `API_KEY`, making book downloads public and logging a security warning. A configured key still requires authentication.
+- `INPX_MAX_DECOMPRESSED_BYTES` — positive integer, default `2147483648` (2 GiB). Aggregate decompressed-byte budget across catalog entries read during startup (including metadata and discarded overlong lines).
+- `INPX_MAX_RECORDS` — positive integer, default `20000000`. Aggregate `.inp` line budget across all entries, including blank, malformed, overlong, and duplicate records. Exceeding either INPX budget rejects the catalog and falls back to range-scan mode.
+
+See `.env.example` for configuration examples; export these variables in the process environment (the service does not load `.env` automatically).
 
 ## Lookup modes
 

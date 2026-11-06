@@ -28,6 +28,47 @@ const MAX_INFO: u64 = 64 * 1024;
 /// Cap on the number of indexed books.
 const MAX_BOOKS: usize = 10_000_000;
 
+/// Aggregate startup work limits, shared by all entries in one catalog.
+#[derive(Clone, Copy)]
+pub struct Limits {
+    pub max_decompressed_bytes: u64,
+    pub max_records: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_decompressed_bytes: 2 * 1024 * 1024 * 1024,
+            max_records: 20_000_000,
+        }
+    }
+}
+
+struct BudgetReader<'a, R> {
+    inner: R,
+    remaining: &'a mut u64,
+}
+
+impl<R: Read> Read for BudgetReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Probe at most one byte beyond the budget, including for lines being discarded.
+        let cap = buf.len().min(
+            self.remaining
+                .saturating_add(1)
+                .try_into()
+                .unwrap_or(usize::MAX),
+        );
+        let n = self.inner.read(&mut buf[..cap])?;
+        if n as u64 > *self.remaining {
+            return Err(std::io::Error::other(
+                "INPX total decompressed bytes budget exceeded",
+            ));
+        }
+        *self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
 /// Field positions inside an `.inp` line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Layout {
@@ -231,6 +272,7 @@ impl InpxIndex {
         mut data: impl BufRead,
         archive: u32,
         layout: &Layout,
+        remaining_records: &mut u64,
     ) -> Result<(), ArchiveError> {
         let mut ext_ids: HashMap<String, u16> = HashMap::new();
         for (i, e) in self.exts.iter().enumerate() {
@@ -238,6 +280,12 @@ impl InpxIndex {
         }
         let mut buf = Vec::new();
         while let Some(ok) = read_line(&mut data, &mut buf)? {
+            if *remaining_records == 0 {
+                return Err(ArchiveError::Limit(
+                    "INPX total processed records budget exceeded".into(),
+                ));
+            }
+            *remaining_records -= 1;
             if !ok {
                 self.malformed += 1;
                 continue;
@@ -295,12 +343,18 @@ impl InpxIndex {
 }
 
 /// Loads an index from an `.inpx` file. Archives are resolved relative to its directory.
-pub fn load(inpx: &Path) -> Result<InpxIndex, ArchiveError> {
+pub fn load(inpx: &Path, limits: Limits) -> Result<InpxIndex, ArchiveError> {
     let dir = inpx.parent().unwrap_or(Path::new("."));
-    load_from(File::open(inpx)?, dir)
+    load_from(File::open(inpx)?, dir, limits)
 }
 
-pub fn load_from<R: Read + Seek>(reader: R, dir: &Path) -> Result<InpxIndex, ArchiveError> {
+pub fn load_from<R: Read + Seek>(
+    reader: R,
+    dir: &Path,
+    limits: Limits,
+) -> Result<InpxIndex, ArchiveError> {
+    let mut remaining_bytes = limits.max_decompressed_bytes;
+    let mut remaining_records = limits.max_records;
     let mut zip = ZipArchive::new(reader)?;
     let mut index = InpxIndex {
         version: "unknown".into(),
@@ -321,7 +375,12 @@ pub fn load_from<R: Read + Seek>(reader: R, dir: &Path) -> Result<InpxIndex, Arc
             continue;
         }
         let mut buf = Vec::new();
-        entry.take(MAX_INFO + 1).read_to_end(&mut buf)?;
+        BudgetReader {
+            inner: entry,
+            remaining: &mut remaining_bytes,
+        }
+        .take(MAX_INFO + 1)
+        .read_to_end(&mut buf)?;
         if buf.len() as u64 > MAX_INFO {
             warn!("{base} is larger than {MAX_INFO} bytes; ignored");
             continue;
@@ -351,7 +410,15 @@ pub fn load_from<R: Read + Seek>(reader: R, dir: &Path) -> Result<InpxIndex, Arc
         let archive = u32::try_from(index.archives.len())
             .map_err(|_| ArchiveError::Limit("too many archives".into()))?;
         index.archives.push(dir.join(format!("{stem}.zip")));
-        index.add_inp(BufReader::new(entry), archive, &layout)?;
+        index.add_inp(
+            BufReader::new(BudgetReader {
+                inner: entry,
+                remaining: &mut remaining_bytes,
+            }),
+            archive,
+            &layout,
+            &mut remaining_records,
+        )?;
     }
     if index.malformed > 0 {
         warn!("Skipped {} malformed INPX lines", index.malformed);
@@ -461,7 +528,7 @@ pub mod tests {
                 ("collection.info", b"x"),
             ],
         );
-        let idx = load(&p).unwrap();
+        let idx = load(&p, Limits::default()).unwrap();
         assert_eq!(idx.version, "20261001");
         assert_eq!(idx.malformed, 1);
         assert_eq!(idx.len(), 4);
@@ -479,6 +546,84 @@ pub mod tests {
         assert_eq!(h.entry, "b.mobi");
         assert!(idx.lookup(999).is_none());
         assert!(idx.lookup(u64::MAX).is_none());
+    }
+
+    #[test]
+    fn decompressed_budget_stops_discarding_an_overlong_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.inpx");
+        let long = vec![b'x'; MAX_LINE * 4];
+        make_zip(&p, &[("a.inp", &long)]);
+        let error = load(
+            &p,
+            Limits {
+                max_decompressed_bytes: (MAX_LINE * 2) as u64,
+                ..Limits::default()
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(error
+            .to_string()
+            .contains("decompressed bytes budget exceeded"));
+    }
+
+    #[test]
+    fn byte_budget_is_shared_by_metadata_and_inp_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.inpx");
+        make_zip(
+            &p,
+            &[
+                ("version.info", b"1234"),
+                ("a.inp", b"xx\n"),
+                ("b.inp", b"yy\n"),
+            ],
+        );
+        let limits = Limits {
+            max_decompressed_bytes: 10,
+            ..Limits::default()
+        };
+        assert!(load(&p, limits).is_ok());
+        let error = load(
+            &p,
+            Limits {
+                max_decompressed_bytes: 9,
+                ..limits
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(error
+            .to_string()
+            .contains("decompressed bytes budget exceeded"));
+    }
+
+    #[test]
+    fn record_budget_counts_duplicates_and_skipped_lines_across_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.inpx");
+        let record = line("1", "1", "0", "fb2");
+        let a = format!("{record}\n{record}\n");
+        let b = format!("\nbroken\n{}\n", "x".repeat(MAX_LINE + 10));
+        make_zip(&p, &[("a.inp", a.as_bytes()), ("b.inp", b.as_bytes())]);
+        let limits = Limits {
+            max_records: 5,
+            ..Limits::default()
+        };
+        assert!(load(&p, limits).is_ok());
+        let error = load(
+            &p,
+            Limits {
+                max_records: 4,
+                ..limits
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(error
+            .to_string()
+            .contains("processed records budget exceeded"));
     }
 
     #[test]
@@ -508,7 +653,7 @@ pub mod tests {
                 ("structure.info", b"LIBID;GENRE;FILE;DEL;EXT"),
             ],
         );
-        let idx = load(&p).unwrap();
+        let idx = load(&p, Limits::default()).unwrap();
         assert_eq!(idx.malformed, 1);
         let h = idx.lookup(9).unwrap();
         assert_eq!(h.entry, "fileX.pdf");

@@ -2,6 +2,10 @@ use std::{
     fs::File,
     io::{self, Read, Seek},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use super::inpx::{Hit, InpxIndex};
@@ -200,12 +204,39 @@ fn locate_inpx(
 }
 
 /// Finds and spools the book within ONE opened archive (no TOCTOU).
+struct CancelOnDrop(Arc<AtomicBool>);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+struct CancelWriter<'a> {
+    file: &'a mut File,
+    cancel: &'a AtomicBool,
+}
+impl io::Write for CancelWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::other("extraction cancelled"));
+        }
+        self.file.write(&buf[..buf.len().min(64 * 1024)])
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+impl Seek for CancelWriter<'_> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
 fn extract(
     path: &Path,
     id: u64,
     hit: Option<&Hit>,
     format: Option<&str>,
     max: u64,
+    cancel: &AtomicBool,
 ) -> Result<Option<Spooled>, ArchiveError> {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -238,7 +269,10 @@ fn extract(
         if entry.compressed_size() > max || entry.size() > max {
             return Err(ArchiveError::Limit(format!("entry of book {id} too large")));
         }
-        let mut writer = ZipWriter::new(&mut tmp);
+        let mut writer = ZipWriter::new(CancelWriter {
+            file: &mut tmp,
+            cancel,
+        });
         writer.raw_copy_file_rename(entry, format!("{id}.{ext}"))?;
         writer.finish()?;
     } else {
@@ -246,7 +280,13 @@ fn extract(
         if entry.size() > max {
             return Err(ArchiveError::Limit(format!("entry of book {id} too large")));
         }
-        let n = io::copy(&mut entry.take(max + 1), &mut tmp)?;
+        let n = io::copy(
+            &mut entry.take(max + 1),
+            &mut CancelWriter {
+                file: &mut tmp,
+                cancel,
+            },
+        )?;
         if n > max {
             return Err(ArchiveError::Limit(format!("entry of book {id} too large")));
         }
@@ -272,20 +312,36 @@ impl Catalog {
     /// Finds book `id` (optionally only with lowercase extension `format`) and
     /// spools it to a temp file (wrapped in a zip for fb2). `Ok(None)` means
     /// not found; I/O and zip errors are returned as errors.
+    #[cfg(test)]
     pub async fn fetch(
         &self,
         id: u64,
         format: Option<&'static str>,
         max: u64,
     ) -> Result<Option<Output>, ArchiveError> {
+        self.fetch_with_permit(id, format, max, None).await
+    }
+
+    pub async fn fetch_with_permit(
+        &self,
+        id: u64,
+        format: Option<&'static str>,
+        max: u64,
+        permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    ) -> Result<Option<Output>, ArchiveError> {
+        let cancellation = CancelOnDrop(Arc::new(AtomicBool::new(false)));
         let spooled = match self {
             Catalog::Ranges(index) => {
                 let mut first_err = None;
                 let mut result = None;
                 for path in index.candidates(id) {
-                    let res =
-                        tokio::task::spawn_blocking(move || extract(&path, id, None, format, max))
-                            .await?;
+                    let cancel = cancellation.0.clone();
+                    let permit = permit.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        extract(&path, id, None, format, max, &cancel)
+                    })
+                    .await?;
                     match res {
                         Ok(Some(s)) => {
                             result = Some(s);
@@ -311,9 +367,11 @@ impl Catalog {
                 if !accepts(format, &hit.ext) {
                     return Ok(None);
                 }
+                let cancel = cancellation.0.clone();
                 tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
                     let path = hit.archive.clone();
-                    extract(&path, id, Some(&hit), format, max)
+                    extract(&path, id, Some(&hit), format, max, &cancel)
                 })
                 .await??
             }
@@ -358,6 +416,18 @@ pub mod tests {
     }
 
     const MAX: u64 = 1 << 20;
+
+    #[test]
+    fn cancelled_copy_stops_between_chunks() {
+        let mut file = tempfile::tempfile().unwrap();
+        let cancel = AtomicBool::new(true);
+        let mut writer = CancelWriter {
+            file: &mut file,
+            cancel: &cancel,
+        };
+        assert!(io::copy(&mut io::repeat(0).take(100_000), &mut writer).is_err());
+        assert_eq!(file.metadata().unwrap().len(), 0);
+    }
 
     #[tokio::test]
     async fn scan_and_lookup() {

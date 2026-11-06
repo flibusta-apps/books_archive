@@ -11,8 +11,6 @@ use axum::{
 };
 use subtle::ConstantTimeEq;
 use thiserror::Error;
-use tokio_util::io::ReaderStream;
-use tower::limit::ConcurrencyLimitLayer;
 use tracing::error;
 
 use crate::services::archive::{ArchiveError, Catalog};
@@ -24,6 +22,8 @@ pub struct AppState {
     pub max_entry_bytes: u64,
     pub timeout: Duration,
     pub max_concurrent: usize,
+    pub serving: Arc<tokio::sync::Semaphore>,
+    pub body_idle_timeout: Duration,
 }
 
 impl AppState {
@@ -34,6 +34,14 @@ impl AppState {
             max_entry_bytes: 512 * 1024 * 1024,
             timeout: Duration::from_secs(600),
             max_concurrent: 16,
+            serving: Arc::new(tokio::sync::Semaphore::new(16)),
+            body_idle_timeout: Duration::from_secs(
+                std::env::var("BODY_IDLE_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(60),
+            ),
         }
     }
 }
@@ -118,10 +126,21 @@ async fn get_book(
 ) -> Result<Response, ApiError> {
     let want = parse_format(&format).ok_or(ApiError::NotFound)?;
     let id = parse_id(&id)?;
-    let out = tokio::time::timeout(s.timeout, s.index.fetch(id, want, s.max_entry_bytes))
-        .await
-        .map_err(|_| ApiError::Timeout)??
-        .ok_or(ApiError::NotFound)?;
+    let permit = Arc::new(
+        s.serving
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?,
+    );
+    let out = tokio::time::timeout(
+        s.timeout,
+        s.index
+            .fetch_with_permit(id, want, s.max_entry_bytes, Some(permit.clone())),
+    )
+    .await
+    .map_err(|_| ApiError::Timeout)??
+    .ok_or(ApiError::NotFound)?;
 
     let (ctype, filename) = if out.zipped {
         ("application/zip", format!("{id}.{}.zip", out.ext))
@@ -137,7 +156,7 @@ async fn get_book(
         HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
             .map_err(|_| ApiError::Internal(format!("bad content-disposition {filename:?}")))?,
     );
-    let stream = ReaderStream::with_capacity(out.file, 64 * 1024);
+    let stream = crate::streaming::idle_stream(Box::pin(out.file), permit, s.body_idle_timeout);
     Ok((headers, Body::from_stream(stream)).into_response())
 }
 
@@ -164,10 +183,13 @@ async fn ready(State(s): State<AppState>) -> StatusCode {
 }
 
 pub fn get_router(state: AppState) -> Router {
+    let state = AppState {
+        serving: Arc::new(tokio::sync::Semaphore::new(state.max_concurrent)),
+        ..state
+    };
     let books = Router::new()
         .route("/b/{id}/{format}", get(get_book))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
-        .layer(ConcurrencyLimitLayer::new(state.max_concurrent))
         .with_state(state.clone());
 
     Router::new()
@@ -247,7 +269,12 @@ mod tests {
             std::fs::remove_file(sub.join("books-a.zip")).unwrap();
         }
         assert_eq!(inpx::discover(dir.path()), Ok(Some(inpx.clone())));
-        let state = AppState::new(Arc::new(Catalog::Inpx(inpx::load(&inpx).unwrap())), None);
+        let state = AppState::new(
+            Arc::new(Catalog::Inpx(
+                inpx::load(&inpx, inpx::Limits::default()).unwrap(),
+            )),
+            None,
+        );
         (get_router(state), dir)
     }
 
